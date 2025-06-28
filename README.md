@@ -1,4 +1,3 @@
-```markdown
 # native-svc
 
 [![Rust](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
@@ -187,4 +186,3 @@ This project is licensed under MIT. See the [LICENSE](LICENSE) files for details
 ---
 
 **Made with ❤️ in Rust**
-```
