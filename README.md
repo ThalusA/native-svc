@@ -5,6 +5,8 @@
 [![Documentation](https://docs.rs/native-svc/badge.svg)](https://docs.rs/native-svc)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
+A lightweight, blocking HTTP client for testing embedded Rust environments in native environments, built on hyper and tokio. It implements the embedded_svc::http::client::Connection trait with TLS support, zero-copy buffering, custom error handling, and synchronous I/O over HTTP bodies.
+
 An HTTP adapter that implements the `embedded-svc` interface using `hyper` as the backend.
 
 This library enables HTTP/HTTPS requests with a familiar synchronous API while leveraging the power and robustness of `hyper` under the hood.
