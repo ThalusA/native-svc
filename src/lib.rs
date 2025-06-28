@@ -1,3 +1,9 @@
+//! Hyper HTTP connection implementation using `hyper` and `tokio` runtime.
+//!
+//! This module provides a `HyperHttpConnection` type that implements the `embedded_svc`
+//! HTTP client `Connection` trait, allowing synchronous-style HTTP requests on top of
+//! the asynchronous `hyper` library.
+
 pub mod error;
 
 use crate::error::HyperError;
@@ -14,11 +20,29 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::runtime::Runtime;
 
-/// Default buffer size for writing into the request body.
+/// Default capacity for the internal write buffer.
 const DEFAULT_BUFFER_SIZE: usize = 8192;
 
+/// Type alias for the Hyper client with TLS support and full-body requests.
 type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// An HTTP connection using the Hyper library and Tokio runtime.
+///
+/// `HyperHttpConnection` wraps a synchronous-style API on top of an async `hyper`
+/// client, implementing the `embedded_svc::http::client::Connection` trait.
+///
+/// # Example
+///
+/// ```no_run
+/// use embedded_svc::http::client::Client;
+/// use native_svc::HyperHttpConnection;
+///
+/// let conn = HyperHttpConnection::new().unwrap();
+/// let mut client = Client::wrap(conn);
+/// let mut request = client.get("https://example.com").unwrap();
+/// let mut response = request.submit().unwrap();
+/// // read, process, etc.
+/// ```
 pub struct HyperHttpConnection {
     rt: Runtime,
     client: HyperClient,
@@ -29,6 +53,11 @@ pub struct HyperHttpConnection {
 }
 
 impl HyperHttpConnection {
+    /// Creates a new `HyperHttpConnection` instance.
+    ///
+    /// Initializes a Tokio runtime, a TLS-enabled Hyper client, and
+    /// prepares internal buffers. Returns an error if the runtime
+    /// cannot be created.
     pub fn new() -> Result<Self, HyperError> {
         let https = HttpsConnector::new();
         let client = Client::builder(TokioExecutor::new()).build(https);
@@ -44,7 +73,9 @@ impl HyperHttpConnection {
         })
     }
 
-    /// Méthode helper pour mapper les méthodes HTTP
+    /// Helper for mapping the embedded-svc HTTP `Method` enum to `hyper::Method`.
+    ///
+    /// Returns an error if the provided method is unsupported.
     fn map_method(method: Method) -> Result<hyper::Method, HyperError> {
         match method {
             Method::Delete => Ok(hyper::Method::DELETE),
@@ -56,11 +87,14 @@ impl HyperHttpConnection {
             Method::Options => Ok(hyper::Method::OPTIONS),
             Method::Trace => Ok(hyper::Method::TRACE),
             Method::Patch => Ok(hyper::Method::PATCH),
-            _ => Err(HyperError::UnsupportedMethod(format!("{:?}", method))),
+            _ => Err(HyperError::UnsupportedMethod(format!("{method:?}"))),
         }
     }
 
-    /// Construit la HeaderMap à partir des headers fournis
+    /// Constructs a `HeaderMap` from a slice of `(name, value)` pairs.
+    ///
+    /// Performs validation on header names and values, returning an error
+    /// if any are invalid.
     fn build_headers(headers: &[(&str, &str)]) -> Result<HeaderMap, HyperError> {
         let mut header_map = HeaderMap::with_capacity(headers.len());
 
@@ -75,12 +109,17 @@ impl HyperHttpConnection {
         Ok(header_map)
     }
 
-    /// Vérifie qu'une réponse existe
+    /// Ensures that a response has been received, returning a reference to it.
+    ///
+    /// Returns `HyperError::NoResponse` if no response is available.
     fn ensure_response(&self) -> Result<&Response<Incoming>, HyperError> {
         self.response.as_ref().ok_or(HyperError::NoResponse)
     }
 
-    /// Charge le body de la réponse dans le buffer de lecture
+    /// Loads the entire response body into the internal read buffer.
+    ///
+    /// This consumes the `Response<Incoming>` and collects its body
+    /// into a contiguous `Bytes` buffer for streamline `Read` operations.
     fn load_response_body(&mut self) -> Result<(), HyperError> {
         if let Some(mut response) = self.response.take() {
             let body_future = response.body_mut().collect();
@@ -92,22 +131,28 @@ impl HyperHttpConnection {
 }
 
 impl Default for HyperHttpConnection {
+    /// Provides a default instance, panicking on failure.
+    ///
+    /// Equivalent to calling `HyperHttpConnection::new().unwrap()`.
     fn default() -> Self {
         Self::new().expect("Failed to create HyperHttpConnection")
     }
 }
 
 impl ErrorType for HyperHttpConnection {
+    /// The error type returned by this connection.
     type Error = HyperError;
 }
 
 impl Status for HyperHttpConnection {
+    /// Returns the HTTP status code of the last response, or 500 if none.
     fn status(&self) -> u16 {
         self.ensure_response()
             .map(|response| response.status().as_u16())
             .unwrap_or(500)
     }
 
+    /// Returns the reason phrase of the last response status, if available.
     fn status_message(&self) -> Option<&'_ str> {
         self.ensure_response()
             .ok()
@@ -116,6 +161,7 @@ impl Status for HyperHttpConnection {
 }
 
 impl Headers for HyperHttpConnection {
+    /// Retrieves a header value by name from the last response, if set.
     fn header(&self, name: &str) -> Option<&'_ str> {
         self.ensure_response()
             .ok()
@@ -125,8 +171,10 @@ impl Headers for HyperHttpConnection {
 }
 
 impl Read for HyperHttpConnection {
+    /// Reads data from the internal buffer, loading the response
+    /// body if needed. Returns `Ok(0)` on EOF.
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
-        // Charger le body si le buffer est vide et qu'on a une réponse
+        // Load the body if buffer empty and response exists
         if self.read_buffer.is_empty() && self.response.is_some() {
             self.load_response_body()?;
         }
@@ -137,8 +185,6 @@ impl Read for HyperHttpConnection {
 
         let length = self.read_buffer.len().min(buffer.len());
         buffer[..length].copy_from_slice(&self.read_buffer[..length]);
-
-        // Utiliser slice pour éviter la copie
         self.read_buffer = self.read_buffer.slice(length..);
 
         Ok(length)
@@ -146,17 +192,17 @@ impl Read for HyperHttpConnection {
 }
 
 impl Write for HyperHttpConnection {
+    /// Buffers data to be sent in the request body.
     fn write(&mut self, buf: &[u8]) -> Result<usize, HyperError> {
         self.write_buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
 
+    /// Finalizes the request body by replacing it with the buffered data.
     fn flush(&mut self) -> Result<(), HyperError> {
         let request = self.request.as_mut().ok_or(HyperError::NoRequest)?;
-
         let body_data = std::mem::take(&mut self.write_buffer);
         *request.body_mut() = Full::from(body_data);
-
         Ok(())
     }
 }
@@ -167,6 +213,7 @@ impl Connection for HyperHttpConnection {
     type RawConnectionError = HyperError;
     type RawConnection = Self;
 
+    /// Begins constructing an HTTP request with method, URI, and headers.
     fn initiate_request<'a>(
         &'a mut self,
         method: Method,
@@ -177,8 +224,6 @@ impl Connection for HyperHttpConnection {
         let header_map = Self::build_headers(headers)?;
 
         let mut request_builder = Request::builder().method(mapped_method).uri(uri);
-
-        // Gestion plus propre des headers
         if let Some(headers_mut) = request_builder.headers_mut() {
             headers_mut.extend(header_map);
         }
@@ -195,13 +240,14 @@ impl Connection for HyperHttpConnection {
         Ok(())
     }
 
+    /// Returns `true` if a request has been initiated.
     fn is_request_initiated(&self) -> bool {
         self.request.is_some()
     }
 
+    /// Sends the initiated request and stores the response.
     fn initiate_response(&mut self) -> Result<(), Self::Error> {
         let request = self.request.take().ok_or(HyperError::NoRequest)?;
-
         let response_future = self.client.request(request);
         let response = self
             .rt
@@ -212,17 +258,20 @@ impl Connection for HyperHttpConnection {
         Ok(())
     }
 
+    /// Returns `true` if a response has been received.
     fn is_response_initiated(&self) -> bool {
         self.response.is_some()
     }
 
+    /// Splits the connection into its header and body parts.
     fn split(&mut self) -> (&Self::Headers, &mut Self::Read) {
-        // Utilisation d'un pointeur sûr
+        // Safe pointer dance to return two references to self
         let headers: *const Self = self;
         let headers = unsafe { &*headers };
         (headers, self)
     }
 
+    /// Returns a mutable reference to the raw connection.
     fn raw_connection(&mut self) -> Result<&mut Self::RawConnection, Self::Error> {
         Ok(self)
     }
@@ -233,6 +282,7 @@ mod tests {
     use super::*;
     use embedded_svc::http::client::Client;
 
+    /// Tests a full GET request/response cycle against httpbin.org
     #[test]
     fn test_request_and_response_flow() {
         let conn = HyperHttpConnection::new().unwrap();
@@ -255,6 +305,7 @@ mod tests {
         println!("{}", str::from_utf8(&body).unwrap());
     }
 
+    /// Tests sending a JSON body via POST and reading the response.
     #[test]
     fn test_write_body_and_send() {
         let conn = HyperHttpConnection::new().unwrap();
