@@ -9,35 +9,92 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{HeaderMap, Request, Response};
 use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::runtime::Runtime;
 
+/// Default buffer size for writing into the request body.
+const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
 pub struct HyperHttpConnection {
     rt: Runtime,
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: HyperClient,
     request: Option<Request<Full<Bytes>>>,
     response: Option<Response<Incoming>>,
-    pending_read: Vec<u8>,
-    pending_write: Vec<u8>,
+    read_buffer: Bytes,
+    write_buffer: Vec<u8>,
 }
 
 impl HyperHttpConnection {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, HyperError> {
         let https = HttpsConnector::new();
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-        Self {
-            rt: Runtime::new().expect("failed to start tokio runtime"),
+        let client = Client::builder(TokioExecutor::new()).build(https);
+        let rt = Runtime::new().map_err(HyperError::RuntimeCreation)?;
+
+        Ok(Self {
+            rt,
             client,
             request: None,
             response: None,
-            pending_read: vec![],
-            pending_write: vec![],
+            read_buffer: Bytes::new(),
+            write_buffer: Vec::with_capacity(DEFAULT_BUFFER_SIZE),
+        })
+    }
+
+    /// Méthode helper pour mapper les méthodes HTTP
+    fn map_method(method: Method) -> Result<hyper::Method, HyperError> {
+        match method {
+            Method::Delete => Ok(hyper::Method::DELETE),
+            Method::Get => Ok(hyper::Method::GET),
+            Method::Head => Ok(hyper::Method::HEAD),
+            Method::Post => Ok(hyper::Method::POST),
+            Method::Put => Ok(hyper::Method::PUT),
+            Method::Connect => Ok(hyper::Method::CONNECT),
+            Method::Options => Ok(hyper::Method::OPTIONS),
+            Method::Trace => Ok(hyper::Method::TRACE),
+            Method::Patch => Ok(hyper::Method::PATCH),
+            _ => Err(HyperError::UnsupportedMethod(format!("{:?}", method))),
         }
     }
-    
-    
+
+    /// Construit la HeaderMap à partir des headers fournis
+    fn build_headers(headers: &[(&str, &str)]) -> Result<HeaderMap, HyperError> {
+        let mut header_map = HeaderMap::with_capacity(headers.len());
+
+        for &(name, value) in headers {
+            let header_name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(HyperError::InvalidHeaderName)?;
+            let header_value =
+                HeaderValue::from_str(value).map_err(HyperError::InvalidHeaderValue)?;
+            header_map.insert(header_name, header_value);
+        }
+
+        Ok(header_map)
+    }
+
+    /// Vérifie qu'une réponse existe
+    fn ensure_response(&self) -> Result<&Response<Incoming>, HyperError> {
+        self.response.as_ref().ok_or(HyperError::NoResponse)
+    }
+
+    /// Charge le body de la réponse dans le buffer de lecture
+    fn load_response_body(&mut self) -> Result<(), HyperError> {
+        if let Some(mut response) = self.response.take() {
+            let body_future = response.body_mut().collect();
+            let body = self.rt.block_on(body_future).map_err(HyperError::Hyper)?;
+            self.read_buffer = body.to_bytes();
+        }
+        Ok(())
+    }
+}
+
+impl Default for HyperHttpConnection {
+    fn default() -> Self {
+        Self::new().expect("Failed to create HyperHttpConnection")
+    }
 }
 
 impl ErrorType for HyperHttpConnection {
@@ -46,67 +103,60 @@ impl ErrorType for HyperHttpConnection {
 
 impl Status for HyperHttpConnection {
     fn status(&self) -> u16 {
-        self.response
-            .as_ref()
-            .expect("should be a response")
-            .status()
-            .as_u16()
+        self.ensure_response()
+            .map(|response| response.status().as_u16())
+            .unwrap_or(500)
     }
 
     fn status_message(&self) -> Option<&'_ str> {
-        self.response
-            .as_ref()
-            .expect("should be a response")
-            .status()
-            .canonical_reason()
+        self.ensure_response()
+            .ok()
+            .and_then(|response| response.status().canonical_reason())
     }
 }
 
 impl Headers for HyperHttpConnection {
     fn header(&self, name: &str) -> Option<&'_ str> {
-        self.response
-            .as_ref()
-            .expect("should be a response")
-            .headers()
-            .get(name)
+        self.ensure_response()
+            .ok()
+            .and_then(|response| response.headers().get(name))
             .and_then(|value| value.to_str().ok())
     }
 }
 
 impl Read for HyperHttpConnection {
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
-        if self.pending_read.is_empty() {
-            match &mut self.response {
-                Some(response) => {
-                    let body = response.body_mut().collect();
-                    let bytes = self.rt.block_on(body)?;
-                    let bytes = bytes.to_bytes().to_vec();
-                    self.pending_read = bytes;
-                    self.response = None;
-                }
-                None => return Ok(0),
-            }
+        // Charger le body si le buffer est vide et qu'on a une réponse
+        if self.read_buffer.is_empty() && self.response.is_some() {
+            self.load_response_body()?;
         }
-        let length = self.pending_read.len().min(buffer.len());
-        buffer[..length].copy_from_slice(&self.pending_read[..length]);
-        self.pending_read.drain(..length);
+
+        if self.read_buffer.is_empty() {
+            return Ok(0); // EOF
+        }
+
+        let length = self.read_buffer.len().min(buffer.len());
+        buffer[..length].copy_from_slice(&self.read_buffer[..length]);
+
+        // Utiliser slice pour éviter la copie
+        self.read_buffer = self.read_buffer.slice(length..);
+
         Ok(length)
     }
 }
 
 impl Write for HyperHttpConnection {
     fn write(&mut self, buf: &[u8]) -> Result<usize, HyperError> {
-        self.pending_write.extend_from_slice(buf);
+        self.write_buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> Result<(), HyperError> {
-        *self
-            .request
-            .as_mut()
-            .expect("should be a request")
-            .body_mut() = Full::from(self.pending_write.clone());
-        self.pending_write.clear();
+        let request = self.request.as_mut().ok_or(HyperError::NoRequest)?;
+
+        let body_data = std::mem::take(&mut self.write_buffer);
+        *request.body_mut() = Full::from(body_data);
+
         Ok(())
     }
 }
@@ -123,30 +173,25 @@ impl Connection for HyperHttpConnection {
         uri: &'a str,
         headers: &'a [(&'a str, &'a str)],
     ) -> Result<(), Self::Error> {
-        let mapped_method = match method {
-            Method::Delete => hyper::Method::DELETE,
-            Method::Get => hyper::Method::GET,
-            Method::Head => hyper::Method::HEAD,
-            Method::Post => hyper::Method::POST,
-            Method::Put => hyper::Method::PUT,
-            Method::Connect => hyper::Method::CONNECT,
-            Method::Options => hyper::Method::OPTIONS,
-            Method::Trace => hyper::Method::TRACE,
-            Method::Patch => hyper::Method::PATCH,
-            method => panic!("Method {method:?} is not supported"),
-        };
-        let mut header_map = HeaderMap::new();
-        for &(name, value) in headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(HyperError::from)?;
-            let header_value = HeaderValue::from_str(value).map_err(HyperError::from)?;
-            header_map.insert(header_name, header_value);
+        let mapped_method = Self::map_method(method)?;
+        let header_map = Self::build_headers(headers)?;
+
+        let mut request_builder = Request::builder().method(mapped_method).uri(uri);
+
+        // Gestion plus propre des headers
+        if let Some(headers_mut) = request_builder.headers_mut() {
+            headers_mut.extend(header_map);
         }
 
-        let mut request = Request::builder().method(mapped_method).uri(uri);
-        let _ = request.headers_mut().insert(&mut header_map);
-        let request = request.body(Full::from(Bytes::new())).unwrap();
+        let request = request_builder
+            .body(Full::from(Bytes::new()))
+            .map_err(HyperError::Http)?;
+
         self.request = Some(request);
         self.response = None;
+        self.read_buffer = Bytes::new();
+        self.write_buffer.clear();
+
         Ok(())
     }
 
@@ -155,12 +200,15 @@ impl Connection for HyperHttpConnection {
     }
 
     fn initiate_response(&mut self) -> Result<(), Self::Error> {
-        let request = { self.request.take() };
-        if let Some(request) = request {
-            self.response = self.rt.block_on(self.client.request(request)).ok();
-        } else {
-            panic!("no request");
-        }
+        let request = self.request.take().ok_or(HyperError::NoRequest)?;
+
+        let response_future = self.client.request(request);
+        let response = self
+            .rt
+            .block_on(response_future)
+            .map_err(HyperError::Client)?;
+
+        self.response = Some(response);
         Ok(())
     }
 
@@ -169,9 +217,9 @@ impl Connection for HyperHttpConnection {
     }
 
     fn split(&mut self) -> (&Self::Headers, &mut Self::Read) {
-        let headers: *const HyperHttpConnection = self as *const _;
-        let headers = unsafe { headers.as_ref().unwrap() };
-
+        // Utilisation d'un pointeur sûr
+        let headers: *const Self = self;
+        let headers = unsafe { &*headers };
         (headers, self)
     }
 
@@ -187,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_request_and_response_flow() {
-        let conn = HyperHttpConnection::new();
+        let conn = HyperHttpConnection::new().unwrap();
         let mut client = Client::wrap(conn);
 
         let request = client.get("https://httpbin.org/get").unwrap();
@@ -209,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_write_body_and_send() {
-        let conn = HyperHttpConnection::new();
+        let conn = HyperHttpConnection::new().unwrap();
         let mut client = Client::wrap(conn);
 
         let body = r#"{"test": 2}"#;
