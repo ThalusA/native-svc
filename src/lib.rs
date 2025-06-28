@@ -4,79 +4,40 @@ use crate::error::HyperError;
 use embedded_svc::http::client::Connection;
 use embedded_svc::http::{Headers, Method, Status};
 use embedded_svc::io::{ErrorType, Read, Write};
-use http_body_util::Full;
-use hyper::body::{Body, Bytes, Incoming};
-use hyper::client::conn::http1::{SendRequest, handshake};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{HeaderMap, Request, Response, Uri};
-use hyper_util::rt::TokioIo;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-use tokio::net::TcpStream;
+use hyper::{HeaderMap, Request, Response};
+use hyper_tls::HttpsConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use tokio::runtime::Runtime;
 
 pub struct HyperHttpConnection {
     rt: Runtime,
-    sender: Option<SendRequest<Full<Bytes>>>,
+    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     request: Option<Request<Full<Bytes>>>,
     response: Option<Response<Incoming>>,
     pending_read: Vec<u8>,
+    pending_write: Vec<u8>,
 }
 
 impl HyperHttpConnection {
     pub fn new() -> Self {
+        let https = HttpsConnector::new();
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
         Self {
             rt: Runtime::new().expect("failed to start tokio runtime"),
-            sender: None,
+            client,
             request: None,
             response: None,
-            pending_read: Default::default(),
+            pending_read: vec![],
+            pending_write: vec![],
         }
     }
-
-    pub fn connect(&mut self, url: Uri) {
-        let host = url.host().expect("uri has no host");
-        let port = url.port_u16().unwrap_or(80);
-        let address = format!("{}:{}", host, port);
-        let stream = self.rt.block_on(TcpStream::connect(address)).unwrap();
-        let stream = TokioIo::new(stream);
-        let (sender, conn) = self.rt.block_on(handshake(stream)).unwrap();
-        self.rt.spawn(async move {
-            if let Err(err) = conn.await {
-                println!("Connection failed: {:?}", err);
-            }
-        });
-
-        self.sender = Some(sender);
-    }
-
-    pub fn sender_mut(&mut self) -> &mut SendRequest<Full<Bytes>> {
-        self.sender
-            .as_mut()
-            .expect("should have a connection established")
-    }
-
-    pub fn mut_request(&mut self) -> &mut Request<Full<Bytes>> {
-        self.request.as_mut().expect("should be a request")
-    }
-
-    pub fn mut_response(&mut self) -> &mut Response<Incoming> {
-        self.response.as_mut().expect("should be a response")
-    }
-
-    pub fn sender(&self) -> &SendRequest<Full<Bytes>> {
-        self.sender
-            .as_ref()
-            .expect("should have a connection established")
-    }
-
-    pub fn request(&self) -> &Request<Full<Bytes>> {
-        self.request.as_ref().expect("should be a request")
-    }
-
-    pub fn response(&self) -> &Response<Incoming> {
-        self.response.as_ref().expect("should be a response")
-    }
+    
+    
 }
 
 impl ErrorType for HyperHttpConnection {
@@ -85,17 +46,27 @@ impl ErrorType for HyperHttpConnection {
 
 impl Status for HyperHttpConnection {
     fn status(&self) -> u16 {
-        self.response().status().as_u16()
+        self.response
+            .as_ref()
+            .expect("should be a response")
+            .status()
+            .as_u16()
     }
 
     fn status_message(&self) -> Option<&'_ str> {
-        self.response().status().canonical_reason()
+        self.response
+            .as_ref()
+            .expect("should be a response")
+            .status()
+            .canonical_reason()
     }
 }
 
 impl Headers for HyperHttpConnection {
     fn header(&self, name: &str) -> Option<&'_ str> {
-        self.response()
+        self.response
+            .as_ref()
+            .expect("should be a response")
             .headers()
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -104,47 +75,38 @@ impl Headers for HyperHttpConnection {
 
 impl Read for HyperHttpConnection {
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
-        if !self.pending_read.is_empty() {
-            let length = self.pending_read.len().min(buffer.len());
-            buffer[..length].copy_from_slice(&self.pending_read[..length]);
-            self.pending_read = self.pending_read[length..].to_vec();
-            return Ok(length);
+        if self.pending_read.is_empty() {
+            match &mut self.response {
+                Some(response) => {
+                    let body = response.body_mut().collect();
+                    let bytes = self.rt.block_on(body)?;
+                    let bytes = bytes.to_bytes().to_vec();
+                    self.pending_read = bytes;
+                    self.response = None;
+                }
+                None => return Ok(0),
+            }
         }
-        let response_body = Pin::new(self.mut_response().body_mut());
-        let mut cx = Context::from_waker(&Waker::noop());
-        let frame = response_body
-            .poll_frame(&mut cx)
-            .map_ok(|frame| frame.into_data());
-        let body = match frame {
-            Poll::Ready(Some(Ok(Ok(bytes)))) => bytes,
-            _ => return Ok(0),
-        };
-        let length = body.len().min(buffer.len());
-        buffer[..length].copy_from_slice(&body[..length]);
-        self.pending_read = buffer[length..].to_vec();
+        let length = self.pending_read.len().min(buffer.len());
+        buffer[..length].copy_from_slice(&self.pending_read[..length]);
+        self.pending_read.drain(..length);
         Ok(length)
     }
 }
 
 impl Write for HyperHttpConnection {
     fn write(&mut self, buf: &[u8]) -> Result<usize, HyperError> {
-        let request_body = Pin::new(self.mut_request().body_mut());
-        let mut cx = Context::from_waker(&Waker::noop());
-        let frame = request_body
-            .poll_frame(&mut cx)
-            .map_ok(|frame| frame.into_data());
-        let body = match frame {
-            Poll::Ready(Some(Ok(Ok(bytes)))) => bytes,
-            _ => return Ok(0),
-        };
-        let mut buffer = vec![];
-        buffer.extend_from_slice(&body);
-        buffer.extend_from_slice(buf);
-        *self.mut_request().body_mut() = Full::from(buffer);
+        self.pending_write.extend_from_slice(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> Result<(), HyperError> {
+        *self
+            .request
+            .as_mut()
+            .expect("should be a request")
+            .body_mut() = Full::from(self.pending_write.clone());
+        self.pending_write.clear();
         Ok(())
     }
 }
@@ -195,12 +157,7 @@ impl Connection for HyperHttpConnection {
     fn initiate_response(&mut self) -> Result<(), Self::Error> {
         let request = { self.request.take() };
         if let Some(request) = request {
-            self.connect(request.uri().clone());
-            if let Some(sender) = &mut self.sender {
-                self.response = Some(self.rt.block_on(sender.send_request(request))?);
-            } else {
-                panic!("no sender");
-            }
+            self.response = self.rt.block_on(self.client.request(request)).ok();
         } else {
             panic!("no request");
         }
@@ -233,7 +190,7 @@ mod tests {
         let conn = HyperHttpConnection::new();
         let mut client = Client::wrap(conn);
 
-        let request = client.get("http://httpbin.org/get").unwrap();
+        let request = client.get("https://httpbin.org/get").unwrap();
         let mut response = request.submit().unwrap();
 
         let mut body = Vec::new();
@@ -255,8 +212,16 @@ mod tests {
         let conn = HyperHttpConnection::new();
         let mut client = Client::wrap(conn);
 
-        let headers = &[("User-Agent", "TestAgent")];
-        let request = client.post("http://httpbin.org/post", headers).unwrap();
+        let body = r#"{"test": 2}"#;
+        let len = body.len().to_string();
+        let headers = &[
+            ("User-Agent", "TestAgent"),
+            ("Content-Type", "application/json"),
+            ("Content-Length", &len),
+        ];
+        let mut request = client.post("https://httpbin.org/post", headers).unwrap();
+        request.write(body.as_bytes()).unwrap();
+        request.flush().unwrap();
         let mut response = request.submit().unwrap();
 
         let mut body = Vec::new();
