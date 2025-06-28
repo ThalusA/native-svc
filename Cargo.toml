@@ -8,3 +8,4 @@ embedded-svc = "0.28.1"
 hyper = { version = "1.6.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.14", features = ["tokio"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
+http-body-util = "0.1.3"
