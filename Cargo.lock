@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "native-svc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "embedded-svc",
  "http-body-util",
